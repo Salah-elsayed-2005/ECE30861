@@ -35,6 +35,8 @@ import concurrent.futures as cf
 import os
 import re
 import time
+import json
+import requests
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, Tuple
 
@@ -123,6 +125,151 @@ def _clamp01(x: float) -> float:
 def _bool_to_score(ok: bool) -> float:
     return 1.0 if ok else 0.0
 
+
+# ------------------------- DESCRIPTION via Purdue GenAI Studio ------------------------- #
+# Env:
+#   GEN_AI_STUDIO_API_KEY  -> required
+#   GEN_AI_STUDIO_MODEL    -> optional (default: "llama3.1:latest")
+#   GEN_AI_STUDIO_URL      -> optional (default: "https://genai.rcac.purdue.edu/api/chat/completions")
+
+# ---- cleanup helpers ----
+_MD_CODE = re.compile(r"```.*?```", re.S)
+_MD_IMG = re.compile(r"!\[[^\]]*\]\([^\)]*\)")
+_MD_LINK = re.compile(r"\[([^\]]+)\]\([^\)]*\)")
+_MD_HDR = re.compile(r"^#{1,6}\s*", re.M)
+_MD_FMT = re.compile(r"[*_`>]+")
+_HTML_COMMENT = re.compile(r"<!--.*?-->", re.S)
+_HTML_TAG = re.compile(r"<[^>]+>")
+
+def _strip_markdown(text: str) -> str:
+    text = _MD_CODE.sub("", text or "")
+    text = _MD_IMG.sub("", text)
+    text = _MD_LINK.sub(r"\1", text)
+    text = _MD_HDR.sub("", text)
+    text = _MD_FMT.sub("", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+def _strip_html(text: str) -> str:
+    text = _HTML_COMMENT.sub("", text or "")
+    text = _HTML_TAG.sub("", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+def _first_para(text: str) -> str:
+    for para in re.split(r"\n\s*\n", text or ""):
+        p = para.strip()
+        if len(p) >= 80:
+            return p
+    return (text or "").strip()
+
+# ---- dataset id & README fallbacks (so we always have useful context) ----
+_HF_DATASET_ID = re.compile(r"https?://(?:www\.)?huggingface\.co/datasets/([^/?#\s]+(?:/[^/?#\s]+)?)")
+
+def _dataset_id_from_resource(resource, metadata) -> str:
+    cand = (
+        (getattr(getattr(resource, "ref", None), "name", None) or "")
+        or (getattr(getattr(resource, "ref", None), "repoId", None) or "")
+        or (metadata.get("datasetId") if isinstance(metadata, dict) else "")
+        or (metadata.get("id") if isinstance(metadata, dict) else "")
+        or (metadata.get("repoId") if isinstance(metadata, dict) else "")
+    )
+    if cand:
+        return str(cand)
+    url = (
+        getattr(getattr(resource, "ref", None), "url", None)
+        or getattr(resource, "url", None)
+        or getattr(resource, "source_url", None)
+        or ""
+    )
+    m = _HF_DATASET_ID.match(url)
+    return m.group(1) if m else ""
+
+def _maybe_fetch_dataset_readme(dataset_id: str, timeout_s: int = 6) -> str | None:
+    if not dataset_id:
+        return None
+    try:
+        # public README for context (no auth)
+        u = f"https://huggingface.co/datasets/{dataset_id}/raw/README.md"
+        r = requests.get(u, timeout=timeout_s)
+        if r.ok and r.text:
+            return r.text
+    except Exception:
+        pass
+    return None
+
+# ---- Purdue GenAI Studio client (OpenAI-compatible /chat/completions) ----
+def _pgs_chat_summarize(text: str, *, api_key: str, model: str, timeout_s: int = 25) -> str:
+    """
+    Non-streaming call to PGS /api/chat/completions.
+    Returns a short string or "" on failure (caller handles fallback).
+    """
+    url = os.getenv("GEN_AI_STUDIO_URL", "https://genai.rcac.purdue.edu/api/chat/completions")
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Summarize the following README or repository card into one concise English "
+                    "sentence (<=240 characters). Do not include code, markdown, or HTML. "
+                    "Output only the sentence."
+                ),
+            },
+            {"role": "user", "content": text},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 96,
+        "stream": False,
+    }
+    r = requests.post(url, headers=headers, json=body, timeout=timeout_s)
+    r.raise_for_status()
+    data = r.json()
+    # Expected: {"choices":[{"message":{"content":"...","role":"assistant"}, ...}], ...}
+    try:
+        return (data["choices"][0]["message"]["content"] or "").strip()
+    except Exception:
+        return ""
+
+def _minimal_fallback(category: str, id_or_name: str) -> str:
+    # Keeps NDJSON non-empty if API is unavailable/misconfigured
+    return (f"Hugging Face dataset {id_or_name}".strip() if category == "DATASET"
+            else f"Code repository {id_or_name}".strip() if category == "CODE"
+            else id_or_name or "")
+
+def _pgs_best_description(
+    *,
+    category: str,
+    id_or_name: str,
+    readme: str | None,
+    meta: dict[str, object] | None,
+    max_chars: int = 240,
+) -> str:
+    api_key = os.getenv("GEN_AI_STUDIO_API_KEY")
+    model = os.getenv("GEN_AI_STUDIO_MODEL", "llama3.1:latest")
+    if not api_key:
+        return _minimal_fallback(category, id_or_name)
+
+    # Clean, short context
+    ctx = readme or ""
+    if ctx:
+        ctx = _strip_html(_strip_markdown(ctx))
+    else:
+        ctx = _minimal_fallback(category, id_or_name)  # tiny context if README missing
+    ctx = _first_para(ctx)[:2000]
+
+    try:
+        raw = _pgs_chat_summarize(ctx, api_key=api_key, model=model)
+    except Exception:
+        raw = ""
+
+    clean = _strip_html(_strip_markdown(raw))
+    one = re.split(r"(?<=[.!?])\s+", clean, maxsplit=1)[0].strip()
+    if not one:
+        one = _minimal_fallback(category, id_or_name)
+    return (one[: max_chars - 1] + "…") if len(one) > max_chars else one
 
 # ------------------------- Metric implementations (starter heuristics) ------------------------- #
 # These are intentionally lightweight so Phase-1 runs fast and is easy to extend later.
@@ -358,6 +505,41 @@ def score_resource(resource: Resource) -> Dict[str, Any]:
             net += w * float(record.get(key, 0.0))
     record["net_score"] = _clamp01(net)
     record["net_score_latency"] = max(0, _now_ms() - t0)
+
+    # Add human-readable description ONLY for DATASET and CODE (PGS AI-first)
+    try:
+        if category in ("DATASET", "CODE"):
+            # Robust identifier so we never emit a blank description
+            id_or_name = (
+                name
+                or (getattr(getattr(resource, "ref", None), "repoId", None) or "")
+                or (metadata.get("id") if isinstance(metadata, dict) else "")
+                or (metadata.get("repoId") if isinstance(metadata, dict) else "")
+            )
+            if category == "DATASET" and not id_or_name:
+                id_or_name = _dataset_id_from_resource(resource, metadata)
+
+            # Prefer fetched README; else metadata card; else dataset README fallback
+            readme_src = readme
+            if not readme_src and isinstance(metadata, dict):
+                readme_src = metadata.get("readme") or metadata.get("cardData")
+                if isinstance(readme_src, dict):
+                    readme_src = json.dumps(readme_src, ensure_ascii=False)
+            if category == "DATASET" and not readme_src:
+                rid = id_or_name or _dataset_id_from_resource(resource, metadata)
+                readme_src = _maybe_fetch_dataset_readme(rid)
+
+            record["description"] = _pgs_best_description(
+                category=category,
+                id_or_name=id_or_name or "(unknown)",
+                readme=readme_src,
+                meta=metadata if isinstance(metadata, dict) else {},
+                max_chars=240,
+            ).strip()
+    except Exception:
+        # Never fail the run just because description failed
+        pass
+
 
     return record
 
