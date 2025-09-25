@@ -1,0 +1,37 @@
+# (optional) backup an existing .gitignore if it exists
+[ -f .gitignore ] && cp .gitignore .gitignore.bak
+
+# write a fresh .gitignore
+cat > .gitignore <<'EOF'
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Test & coverage artifacts
+.pytest_cache/
+.test_artifacts/
+.coverage
+coverage.xml
+junit.xml
+
+# Type checkers / linters / caches
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+# Editors / OS files
+.vscode/
+.idea/
+.DS_Store
+
+# Build outputs (if any)
+build/
+dist/
+*.egg-info/
+EOF
